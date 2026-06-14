@@ -9,8 +9,7 @@ Personal Hack The Box lab write-ups, attack paths, and methodology notes.
 | Season | Machines | Status |
 |---|---:|---|
 | [Season 10](seasons/season-10/) | 1 | In progress |
-| [Season 11](seasons/season-11/) | 3 | In progress |
-## Starting Point
+| [Season 11](seasons/season-11/) | 3 | In progress |## Starting Point
 
 | Module | Write-up |
 |---|---|
