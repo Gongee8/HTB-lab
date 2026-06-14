@@ -3,7 +3,7 @@
 ## Overview
 
 - Season: 11
-- Difficulty: TBD
+- Difficulty: Easy
 - OS: Linux
 - Initial Access: React2Shell RCE in a Next.js App Router application
 - Privilege Escalation: Root-owned Node.js inspector exposed on loopback
